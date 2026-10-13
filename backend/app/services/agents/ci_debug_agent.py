@@ -1,3 +1,9 @@
+"""CI/CD 流水线诊断与调试智能体模块.
+
+本模块负责解析 GitHub Actions 运行记录与构建日志文本，
+定位失败 Job、错误堆栈与崩溃原因，输出可落地的排查与修复步骤。
+"""
+
 import re
 from typing import Any
 
@@ -8,6 +14,13 @@ from app.services.llm.prompts import CI_DEBUG_PROMPT
 
 
 class CIDebugAgent(BaseAgent):
+    """CI 流水线排错诊断智能体 (CI Debug Agent).
+
+    【Python 语法与设计要点】:
+    - 日志特征抽取：通过正则表达式和关键字匹配从长文本日志中提取异常上下文；
+    - 结合结构化 Prompt `CI_DEBUG_PROMPT` 进行大模型根因诊断。
+    """
+
     name = "ci_debug_agent"
     description = "分析 workflow 失败日志，并提出排查步骤。"
     available_tools = ["get_workflow_run", "get_workflow_logs", "extract_failed_log_sections"]
@@ -16,6 +29,7 @@ class CIDebugAgent(BaseAgent):
         self.llm = llm or LLMClient()
 
     async def run(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """执行 CI 失败日志诊断分析."""
         fallback = self._fallback_debug(input_data, context)
         llm_output = await self.llm.chat_json(CI_DEBUG_PROMPT, {"workflow_run": input_data, "context": context})
         if llm_output:

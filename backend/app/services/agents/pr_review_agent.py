@@ -1,3 +1,9 @@
+"""Pull Request 代码审查智能体模块.
+
+本模块负责解析 PR 代码差异补丁（Diff chunks），评估文件变更范围与爆炸半径，
+识别架构/安全/兼容性风险，并自动生成结构化的审查建议与测试检查清单。
+"""
+
 from typing import Any
 
 from app.schemas.analysis import PRReviewOutput
@@ -8,6 +14,13 @@ from app.services.rag.chunking import chunk_pr_files
 
 
 class PRReviewAgent(BaseAgent):
+    """代码合并请求审查智能体 (PR Review Agent).
+
+    【Python 语法与设计要点】:
+    - 结合 RAG 分块策略：通过 `chunk_pr_files` 将长 Diff 文本切分为适于 LLM 上下文窗口的微块；
+    - 同样遵循大模型优先、本地启发式兜底的双保险架构。
+    """
+
     name = "pr_review_agent"
     description = "总结 PR diff，并生成风险点、检查清单和测试建议。"
     available_tools = ["get_pull_request_detail", "get_pull_request_files", "chunk_diff"]
@@ -16,6 +29,7 @@ class PRReviewAgent(BaseAgent):
         self.llm = llm or LLMClient()
 
     async def run(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """执行 PR 自动化代码审查分析."""
         diff_chunks = chunk_pr_files(input_data.get("files", []))
         fallback = self._fallback_review(input_data, context, diff_chunks)
         llm_output = await self.llm.chat_json(PR_REVIEW_PROMPT, {"pull_request": input_data, "diff_chunks": diff_chunks, "context": context})

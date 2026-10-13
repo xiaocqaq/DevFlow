@@ -1,3 +1,9 @@
+"""GitHub 实时数据检索智能体模块.
+
+本模块对接 GitHub 服务接口，负责按需检索指定仓库的 Issue 列表、
+Pull Request 补丁、评审行内评论以及 CI Actions 运行记录与日志。
+"""
+
 from typing import Any
 
 from app.services.agents.base import BaseAgent
@@ -7,6 +13,13 @@ from app.services.github.pull_requests import list_pull_request_files, list_pull
 
 
 class GitHubRetrievalAgent(BaseAgent):
+    """GitHub 数据提取智能体 (GitHub Retrieval Agent).
+
+    【Python 语法要点 - 异步服务调用与任务多路分支】:
+    - 统一调度 `app.services.github` 各子模块的异步协程；
+    - 借助任务类型匹配（`if task == ...`）分发并封装字典输出。
+    """
+
     name = "github_retrieval_agent"
     description = "检索 GitHub Issue、PR、diff、Review 评论、workflow run 和失败日志。"
     available_tools = [
@@ -20,6 +33,7 @@ class GitHubRetrievalAgent(BaseAgent):
     ]
 
     async def run(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """根据任务类型检索远端 GitHub 资源."""
         owner = input_data["owner"]
         repo = input_data["repo"]
         token = input_data.get("token")

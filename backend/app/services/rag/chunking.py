@@ -1,3 +1,10 @@
+"""多模态文档与代码语义分块（Chunking）引擎模块.
+
+本模块负责将长篇文档（Markdown、PDF、DOCX）、结构化数据（JSON、CSV）
+及源代码文件切分为适合嵌入模型（Embedding Model）与向量检索的语义块。
+支持基于 AST（抽象语法树）的代码块分割与基于标题层级树的滑动窗口切片。
+"""
+
 from __future__ import annotations
 
 import ast
@@ -17,6 +24,14 @@ STRUCTURED_DATA_SUFFIXES = {".json", ".csv"}
 
 @dataclass
 class _Block:
+    """文档逻辑块中间表示数据类.
+
+    【Python 语法要点 - 不可变元组嵌套与默认字段】:
+    - `section_path: tuple[str, ...] = ()`:
+      使用不可变元组（tuple）记录章节路径栈（如 `("1. 架构设计", "1.1 存储选型")`），
+      保证在后续切分与回溯过程中路径数据不会被意外修改，支持哈希与快速比对。
+    """
+
     text: str
     start_line: int | None
     end_line: int | None
@@ -25,6 +40,7 @@ class _Block:
     section_instance: tuple[tuple[str, int], ...] = ()
     page: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
 
 
 MAX_CHUNKS_PER_DOCUMENT = 5000

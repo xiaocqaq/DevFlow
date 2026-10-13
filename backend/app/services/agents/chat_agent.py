@@ -60,6 +60,14 @@ class GenericToolArgs(BaseModel):
 
 
 class ConversationState(TypedDict, total=False):
+    """LangGraph 状态图全局状态字典定义.
+
+    【Python 语法要点 - TypedDict 与 total=False】:
+    - 继承自 `typing.TypedDict`，为字典结构提供字段名和类型的静态类型安全约束；
+    - `total=False`: 表示字典中的所有键都是可选的（Optional Keys），实例化或更新状态时
+      允许仅提供部分字段，非常适合在多步骤 LangGraph 节点图流转中逐步增量写入状态。
+    """
+
     message: str
     context: dict[str, Any]
     tools: dict[str, StructuredTool]
@@ -84,6 +92,14 @@ class ConversationState(TypedDict, total=False):
 
 
 class ChatAgent(BaseAgent):
+    """基于原生工具调用与 LangGraph 状态图的主交互对话智能体 (Chat Agent).
+
+    【Python 语法与设计要点】:
+    - 基于 LangGraph `StateGraph(ConversationState)` 组装 ReAct（Reasoning + Acting）循环图；
+    - 集成 LangChain `StructuredTool` 原生大模型 Function Calling；
+    - 支持流式输出（Streaming）、动态上下文压缩（Context Compression）与 Token 预算熔断机制。
+    """
+
     name = "chat_agent"
     description = "使用原生工具调用的对话 Agent。LLM 选择 LangChain 工具，记忆工具通过 MCP 执行。"
     available_tools = [
@@ -392,6 +408,20 @@ class ChatAgent(BaseAgent):
         )
 
     def _build_agent_graph(self, tool_model: Any):
+        """构建基于 LangGraph 的 ReAct 工具调用循环状态图.
+
+        【LangGraph 核心架构与 Python 语法要点】:
+        1. 状态图初始化 `StateGraph(ConversationState)`：定义流转在所有节点间的全局状态数据结构；
+        2. 节点（Nodes）：
+           - `model_decision`: LLM 推理节点，分析当前消息与工具执行观察结果，决定调用工具还是输出最终答案；
+           - `tool_action`: 工具执行节点，分发并异步执行大模型选定的工具；
+           - `max_steps_stop`: 步数超限熔断保护节点；
+        3. 条件边（Conditional Edges）：
+           - `add_conditional_edges("model_decision", router, mapping)`:
+             根据大模型输出中是否包含工具调用（tool_calls），动态流转至 `tool_action` 或终止至 `END`；
+           - `add_conditional_edges("tool_action", router, mapping)`:
+             工具执行完毕后，回环至 `model_decision` 供 LLM 获取观察结果继续推理，或触碰限制转至 `max_steps_stop`。
+        """
         async def model_decision_node(state: ConversationState) -> dict[str, Any]:
             return await self._graph_model_decision(state, tool_model)
 

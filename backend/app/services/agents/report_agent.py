@@ -1,14 +1,28 @@
+"""工程周报自动生成智能体模块.
+
+本模块统计指定时间周期内代码仓库的活跃数据（合并 PR 数、关闭 Issue 数、
+CI 失败频次等），自动拼装并渲染标准 Markdown 格式的研发周报。
+"""
+
 from typing import Any
 
 from app.services.agents.base import BaseAgent
 
 
 class ReportAgent(BaseAgent):
+    """工程研发周报生成智能体 (Report Agent).
+
+    【Python 语法要点 - 集合切片与多行 f-string 模板】:
+    - 列表切片 `merged_prs[:8]` 限制摘要展示条数，防止文本过长；
+    - 括号包裹多行字符串 `f"..." \n f"..."`，免除行尾反斜杠转义符，保持代码整洁。
+    """
+
     name = "report_agent"
     description = "根据仓库活动生成工程周报。"
     available_tools = ["list_issues_by_time_range", "list_prs_by_time_range", "list_failed_workflow_runs"]
 
     async def run(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """聚合活动指标并生成周报 Markdown."""
         issues = input_data.get("issues", [])
         prs = input_data.get("pull_requests", [])
         ci_runs = input_data.get("workflow_runs", [])

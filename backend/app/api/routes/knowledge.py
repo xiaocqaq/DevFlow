@@ -1,3 +1,19 @@
+# ==============================================================================
+# 模块名称: 知识库、长期记忆中心与知识图谱路由 (Knowledge, Memory Hub & Graph API)
+# 架构定位: Web 接口层 (API Routes Layer) / 项目知识与长期记忆管理
+# 核心架构与设计模式:
+#   1. 多态切片逻辑聚合算法 (`_group_documents`):
+#      底层的分块存储将一篇长文档切为多个 `Document` 记录，本模块利用 `(source_type, source_id)` 二元组
+#      字典将物理切片动态折叠聚合为完整的逻辑知识卡片 (`KnowledgeItemResponse`)。
+#   2. 记忆萃取与人在回路审批 (Memory Candidate Review Workflow):
+#      Agent 对话中萃取的关键事实先沉淀为 `MemoryCandidate` (pending)，人工审批通过 (`approve_candidate`) 后，
+#      正式转入持久层记忆，并自动触发证据库与知识图谱的联动重建。
+#   3. 确定性主键生成与 Upsert 模式 (`stable_source_id`):
+#      团队成员画像等结构化数据基于 `(repo_id, source_type, identifier)` 派生确定性 UUID，
+#      创建时先清理旧切片再写入，优雅实现无锁幂等更新。
+#   4. 知识图谱 (Knowledge Graph) 子图下发与全量重建端点。
+# ==============================================================================
+
 import asyncio
 import hashlib
 import re
@@ -42,8 +58,10 @@ from app.services.rag.document_processing import SUPPORTED_KNOWLEDGE_SUFFIXES
 from app.services.rag.embeddings import embed_texts, embedding_provider_name
 from app.services.rag.vector_store import DocumentPayload, add_document, add_documents, delete_document_group, stable_source_id
 
+# 路由子模块
 router = APIRouter()
 
+# 用户可直接查看与操作的知识源类型白名单
 USER_KNOWLEDGE_SOURCE_TYPES = [
     "memory_note",
     "knowledge_file",
@@ -53,10 +71,14 @@ USER_KNOWLEDGE_SOURCE_TYPES = [
     "project_doc",
     "project_manifest",
 ]
+# 向量批处理切片批量大小
 EMBEDDING_BATCH_SIZE = 64
 
 
 def _repo_or_404(db: Session, repo_id: uuid.UUID) -> Repository:
+    """
+    【前置拦截器】校验指定仓库实体是否存在。
+    """
     repo = db.get(Repository, repo_id)
     if repo is None:
         raise HTTPException(status_code=404, detail="未找到仓库")
@@ -64,16 +86,25 @@ def _repo_or_404(db: Session, repo_id: uuid.UUID) -> Repository:
 
 
 def _clip(text: str, limit: int = 360) -> str:
+    """
+    【文本摘要截断】规整换行并截取前 limit 字符，超出补省略号。
+    """
     text = (text or "").strip().replace("\r\n", "\n")
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "..."
 
 
 def _safe_filename(filename: str) -> str:
+    """
+    【文件名安全过滤】去除文件名中危险路径字符，仅保留常规英文字符、数字与中文。
+    """
     value = Path(filename or "upload.txt").name
     return re.sub(r"[^a-zA-Z0-9._\-\u4e00-\u9fff]+", "_", value).strip("._") or "upload.txt"
 
 
 def _upload_root(repo_id: uuid.UUID) -> Path:
+    """
+    【路径管理】获取指定仓库的物理上传工作目录。
+    """
     root = Path(settings.upload_dir)
     if not root.is_absolute():
         root = Path.cwd() / root
@@ -83,6 +114,9 @@ def _upload_root(repo_id: uuid.UUID) -> Path:
 
 
 def _extract_upload_text(filename: str, data: bytes) -> str:
+    """
+    【文本提取安全包装】调用底层解析器，发生损坏时平滑回退为空串而不崩溃进程。
+    """
     try:
         return extract_document_text(filename, data)
     except Exception:
@@ -90,6 +124,9 @@ def _extract_upload_text(filename: str, data: bytes) -> str:
 
 
 def _embed_default_in_batches(texts: list[str]) -> list[list[float]]:
+    """
+    【分批向量化处理】按固定步长 `EMBEDDING_BATCH_SIZE` 切片调用嵌入服务，防单次请求 HTTP Payload 超限。
+    """
     vectors: list[list[float]] = []
     for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
         vectors.extend(
@@ -102,6 +139,15 @@ def _embed_default_in_batches(texts: list[str]) -> list[list[float]]:
 
 
 def _group_documents(documents: list[Document]) -> list[KnowledgeItemResponse]:
+    """
+    【切片聚合算法】将打散的多条 Document 切片重新折叠为用户可见的逻辑知识项。
+
+    Python 数据结构与算法解析:
+      1. 使用字典 `groups: dict[tuple[str, uuid.UUID], list[Document]]` 按 `(source_type, source_id)` 归类。
+      2. 针对每个分组内的切片列表，按元数据 `chunk_index` 和创建时间升序排列。
+      3. 提取首个切片的元数据作为逻辑项的代表属性，合并前 2 个切片的内容生成预览。
+      4. 最终按最新创建时间倒序返回列表。
+    """
     groups: dict[tuple[str, uuid.UUID], list[Document]] = {}
     for doc in documents:
         groups.setdefault((doc.source_type, doc.source_id), []).append(doc)
@@ -130,6 +176,9 @@ def _group_documents(documents: list[Document]) -> list[KnowledgeItemResponse]:
 
 
 def _team_from_document(doc: Document) -> TeamMemberResponse:
+    """
+    【实体反序列化】从存储团队画像的 Document 实体中提取元数据，还原为 TeamMemberResponse。
+    """
     meta = doc.meta or {}
     return TeamMemberResponse(
         id=doc.source_id,
@@ -143,6 +192,9 @@ def _team_from_document(doc: Document) -> TeamMemberResponse:
 
 @router.get("/{repo_id}/knowledge", response_model=list[KnowledgeItemResponse])
 async def list_knowledge(repo_id: uuid.UUID, db: Session = Depends(get_db)) -> list[KnowledgeItemResponse]:
+    """
+    【API 接口】查询指定仓库下所有类型的知识库条目列表（已按逻辑源聚合）。
+    """
     _repo_or_404(db, repo_id)
     docs = (
         db.query(Document)
@@ -160,6 +212,13 @@ async def search_memory(
     limit: int = Query(default=8, ge=1, le=30),
     db: Session = Depends(get_db),
 ) -> MemorySearchResponse:
+    """
+    【API 接口】工作区记忆检索并记录召回审计事件。
+
+    特点:
+      - 基于 `EvidenceStore.search` 进行混合搜索。
+      - 记录不可篡改的 `record_recall_event` 召回日志，供系统评估检索命中率。
+    """
     repo = _repo_or_404(db, repo_id)
     query = q.strip()
     results = EvidenceStore(db).search(repo.id, None, query, limit=limit) if query else []
@@ -186,12 +245,18 @@ async def get_recall_events(
     limit: int = Query(default=30, ge=1, le=100),
     db: Session = Depends(get_db),
 ) -> list[RecallEventResponse]:
+    """
+    【API 接口】获取记忆召回审计事件列表。
+    """
     _repo_or_404(db, repo_id)
     return [RecallEventResponse.model_validate(item) for item in list_recall_events(db, repo_id=repo_id, conversation_id=conversation_id, limit=limit)]
 
 
 @router.get("/{repo_id}/memory/status", response_model=MemoryStatusResponse)
 async def get_memory_status(repo_id: uuid.UUID, db: Session = Depends(get_db)) -> MemoryStatusResponse:
+    """
+    【API 接口】查询当前仓库的记忆中心统计健康度（待审批候选数、已确认数等）。
+    """
     repo = _repo_or_404(db, repo_id)
     return MemoryStatusResponse.model_validate(memory_status(db, repo))
 
@@ -203,12 +268,23 @@ async def get_memory_candidates(
     limit: int = Query(default=50, ge=1, le=100),
     db: Session = Depends(get_db),
 ) -> list[MemoryCandidateResponse]:
+    """
+    【API 接口】查询 Agent 对话中自动提炼的待审核记忆候选列表。
+    """
     _repo_or_404(db, repo_id)
     return [MemoryCandidateResponse.model_validate(item) for item in list_memory_candidates(db, repo_id=repo_id, status=status, limit=limit)]
 
 
 @router.post("/{repo_id}/memory/candidates/{candidate_id}/approve", response_model=MemoryCandidateActionResponse)
 async def approve_candidate(repo_id: uuid.UUID, candidate_id: uuid.UUID, db: Session = Depends(get_db)) -> MemoryCandidateActionResponse:
+    """
+    【API 接口 - 人在回路】人工批准 Agent 沉淀的记忆候选。
+
+    副作用:
+      1. 将候选状态标记为 approved。
+      2. 转录为正式的永久记忆 Document。
+      3. 自动触发 `EvidenceStore.rebuild_repo` 与 `rebuild_knowledge_graph` 更新图谱实体。
+    """
     repo = _repo_or_404(db, repo_id)
     try:
         candidate, doc = approve_memory_candidate(db, repo, candidate_id)
@@ -222,6 +298,9 @@ async def approve_candidate(repo_id: uuid.UUID, candidate_id: uuid.UUID, db: Ses
 
 @router.post("/{repo_id}/memory/candidates/{candidate_id}/reject", response_model=MemoryCandidateActionResponse)
 async def reject_candidate(repo_id: uuid.UUID, candidate_id: uuid.UUID, db: Session = Depends(get_db)) -> MemoryCandidateActionResponse:
+    """
+    【API 接口 - 人在回路】拒绝不准确或无价值的记忆候选，状态标记为 rejected。
+    """
     repo = _repo_or_404(db, repo_id)
     try:
         candidate = reject_memory_candidate(db, repo, candidate_id)
@@ -237,6 +316,9 @@ async def create_memory_note(
     payload: MemoryNoteRequest,
     db: Session = Depends(get_db),
 ) -> KnowledgeItemResponse:
+    """
+    【API 接口】手动新建一条记忆便签（即时向量化并增量重塑图谱）。
+    """
     _repo_or_404(db, repo_id)
     content = payload.content.strip()
     title = payload.title.strip() or "未命名记忆"
@@ -262,6 +344,9 @@ async def upload_knowledge_file(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> KnowledgeUploadResponse:
+    """
+    【API 接口 - 同步切片模式】上传知识库文件并同步进行分块、分批 Embedding 与图谱重构。
+    """
     repo = _repo_or_404(db, repo_id)
     data = await file.read(MAX_DOCUMENT_BYTES + 1)
     if not data:
@@ -274,6 +359,8 @@ async def upload_knowledge_file(
     if suffix not in SUPPORTED_KNOWLEDGE_SUFFIXES:
         supported = ", ".join(sorted(SUPPORTED_KNOWLEDGE_SUFFIXES))
         raise HTTPException(status_code=415, detail=f"Unsupported file type. Supported: {supported}")
+
+    # 哈希秒传校验
     checksum = hashlib.sha256(data).hexdigest()
     existing = (
         db.query(Document)
@@ -290,6 +377,8 @@ async def upload_knowledge_file(
             indexed=True,
             duplicate=True,
         )
+
+    # 异步线程池提取文本
     text = await asyncio.to_thread(_extract_upload_text, filename, data)
     if not text.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from this file")
@@ -299,6 +388,8 @@ async def upload_knowledge_file(
     chunks = await asyncio.to_thread(chunk_document, text, filename, 1800, 180)
     if not chunks:
         raise HTTPException(status_code=400, detail="Document did not produce indexable chunks")
+
+    # 构建统一 Payload
     payloads = [
         DocumentPayload(
             source_type="knowledge_file",
@@ -327,6 +418,7 @@ async def upload_knowledge_file(
     ]
     embedding_inputs = [f"{payload.title}\n{payload.content}" for payload in payloads]
     vectors = await asyncio.to_thread(_embed_default_in_batches, embedding_inputs)
+
     try:
         await asyncio.to_thread(stored_path.write_bytes, data)
         docs = add_documents(db, repo_id, payloads, commit=False, vectors=vectors)
@@ -349,6 +441,9 @@ async def get_knowledge_graph(
     depth: int = Query(default=1, ge=1, le=2),
     db: Session = Depends(get_db),
 ) -> KnowledgeGraphResponse:
+    """
+    【API 接口】查询知识图谱结构化网络（节点与关联边，支持聚焦中心节点并按深度探索子图）。
+    """
     repo = _repo_or_404(db, repo_id)
     return KnowledgeGraphResponse.model_validate(
         knowledge_graph_payload(db, repo, center_type=center_type, center_id=center_id, depth=depth)
@@ -357,6 +452,9 @@ async def get_knowledge_graph(
 
 @router.post("/{repo_id}/knowledge/graph/rebuild", response_model=KnowledgeGraphRebuildResponse)
 async def rebuild_knowledge_graph_route(repo_id: uuid.UUID, db: Session = Depends(get_db)) -> KnowledgeGraphRebuildResponse:
+    """
+    【API 接口】手动触发仓库知识图谱的全量重构（基于源码符号、文档、PR、Issue 关联关系）。
+    """
     repo = _repo_or_404(db, repo_id)
     result = rebuild_knowledge_graph(db, repo)
     return KnowledgeGraphRebuildResponse(repo_id=repo.id, edges=result["edges"], nodes=result["nodes"])
@@ -369,6 +467,9 @@ async def delete_knowledge_item(
     source_type: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    """
+    【API 接口】删除某条逻辑知识项（自动清理其包含的全部物理分块切片并刷新图谱）。
+    """
     _repo_or_404(db, repo_id)
     count = delete_document_group(db, repo_id, source_id, source_type=source_type)
     rebuild_knowledge_graph(db, _repo_or_404(db, repo_id))
@@ -377,6 +478,9 @@ async def delete_knowledge_item(
 
 @router.get("/{repo_id}/team-members", response_model=list[TeamMemberResponse])
 async def list_team_members(repo_id: uuid.UUID, db: Session = Depends(get_db)) -> list[TeamMemberResponse]:
+    """
+    【API 接口】查询团队所有成员的技能画像列表。
+    """
     _repo_or_404(db, repo_id)
     docs = (
         db.query(Document)
@@ -393,6 +497,9 @@ async def create_team_member(
     payload: TeamMemberRequest,
     db: Session = Depends(get_db),
 ) -> TeamMemberResponse:
+    """
+    【API 接口】创建或更新团队成员技能画像（采用确定性 source_id 实现优雅 Upsert）。
+    """
     _repo_or_404(db, repo_id)
     name = payload.name.strip()
     if not name:
@@ -405,8 +512,11 @@ async def create_team_member(
             f"tech_stack: {payload.tech_stack.strip()}",
         ]
     )
+    # 基于 name 派生确定性主键
     source_id = stable_source_id(repo_id, "team_member", name.lower())
+    # 清理旧同名记录
     delete_document_group(db, repo_id, source_id, source_type="team_member", commit=False)
+    # 写入新记录
     doc = add_document(
         db,
         repo_id,
@@ -428,7 +538,11 @@ async def create_team_member(
 
 @router.delete("/{repo_id}/team-members/{member_id}")
 async def delete_team_member(repo_id: uuid.UUID, member_id: uuid.UUID, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """
+    【API 接口】删除团队成员技能画像。
+    """
     _repo_or_404(db, repo_id)
     count = delete_document_group(db, repo_id, member_id, source_type="team_member")
     rebuild_knowledge_graph(db, _repo_or_404(db, repo_id))
     return {"repo_id": str(repo_id), "member_id": str(member_id), "deleted": count}
+

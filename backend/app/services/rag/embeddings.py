@@ -1,3 +1,11 @@
+"""文本向量嵌入（Embedding）计算模块.
+
+本模块支持多源向量嵌入生成，包含：
+1. 本地轻量模型推理：基于 sentence-transformers / Qwen3-Embedding；
+2. 阿里 DashScope / OpenAI 兼容远程 API 批量嵌入；
+3. 确定性哈希向量（Deterministic Embedding）：用于离线演示与自动化评测兜底。
+"""
+
 import hashlib
 import math
 import os
@@ -9,6 +17,7 @@ import httpx
 
 from app.core.config import settings
 
+
 def _deterministic_tokens(text: str) -> list[str]:
     lowered = (text or "").lower()
     tokens = re.findall(r"[a-z0-9_\-]+", lowered)
@@ -19,6 +28,21 @@ def _deterministic_tokens(text: str) -> list[str]:
 
 
 def deterministic_embedding(text: str, dimensions: int = 128) -> list[float]:
+    """基于 SHA-256 特征哈希构建确定性稠密向量（Feature Hashing / Hashing Trick）.
+
+    【Python / 数学算法要点】:
+    1. 词切分与哈希映射：通过中英文分词后计算 SHA-256 二进制摘要，映射到固定的维度桶索引 `index % dimensions`；
+    2. L2 范数归一化（L2 Normalization）：
+       计算模长 `norm = sqrt(sum(v_i^2))`，将所有分量缩放为单位长度（Unit Vector），
+       使向量间的点积（Dot Product）直接等价于余弦相似度（Cosine Similarity）。
+
+    Args:
+        text: 输入文本字符串。
+        dimensions: 期望生成的向量维度（默认为 128）。
+
+    Returns:
+        list[float]: 长度为 dimensions 且模长为 1.0 的浮点数向量列表。
+    """
     # 本地演示和 Eval 的兜底实现；生产环境请替换为 LLM embedding API。
     vector = [0.0] * dimensions
     for token in _deterministic_tokens(text):

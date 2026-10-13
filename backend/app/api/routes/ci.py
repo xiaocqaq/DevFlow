@@ -1,3 +1,19 @@
+# ==============================================================================
+# 模块名称: CI 持续集成故障智能排查与根因分析路由 (CI Debug & Workflow Diagnostics API)
+# 架构定位: Web 接口层 (API Routes Layer) / 自动化质量保障端点
+# 核心架构与技术亮点:
+#   1. CI 失败日志启发式挖掘与清洗 (Log Mining & Heuristics):
+#      - `_first_error`: 基于滑动窗口与异常特征词 (Traceback, AssertionError, fatal, npm ERR)
+#        准确定位导致崩溃的“首个关键错误块”，过滤成千上万行的无关编译日志噪音。
+#      - `_related_files_from_logs`: 利用精准文件扩展名正则提取日志中提及的源码/测试文件。
+#   2. CI 运行与 PR 分支快照自动关联 (PR Association & Snapshot):
+#      自动反查触发该 CI 运行的关联 PR (`_related_pr_for_run`)，并调起 Worktree 快照和代码语法图谱。
+#   3. 标准 6 步故障排查工作流 (6-Step CI Debug Workflow):
+#      定位失败 job/step -> 提取关键错误块 -> 判断失败类型 -> 检索代码与 workflow 配置 ->
+#      关联最近变更 -> 输出根因、修复建议与合并阻塞性判定 (is_merge_blocking)。
+#   4. Server-Sent Events (SSE) 实时透明排查轨迹推送。
+# ==============================================================================
+
 import asyncio
 import json
 import re
@@ -19,9 +35,13 @@ from app.services.rag.indexing import sanitize_ci_log
 from app.services.rag.retrieval import search_similar_documents
 from app.services.worktree_manager import prepare_pr_worktree
 
+# 路由子模块
 router = APIRouter()
 
+# 知识库文档类型过滤
 PROJECT_DOC_TYPES = {"knowledge_file", "memory_note", "project_doc"}
+
+# 提示词：引导 Agent 输出面向用户的结构化可解释性排查过程
 PUBLIC_REASONING_PROMPT = """
 你是 DevFlow AI 的 CI 根因分析 Agent。请用中文流式输出一段“公开排查过程”，帮助用户理解你如何按计划定位失败 CI。
 要求：
@@ -33,14 +53,23 @@ PUBLIC_REASONING_PROMPT = """
 
 
 def _encode_sse(event: str, data: dict) -> str:
+    """
+    【协议编码】构造符合规范的 SSE 消息帧。
+    """
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _trace_item(kind: str, title: str, content: str, status: str = "done") -> dict:
+    """
+    【追踪卡片】封装排查链路前端时间线节点。
+    """
     return {"kind": kind, "title": title, "content": content, "status": status}
 
 
 def _document_evidence(items: list[dict], default_source_type: str) -> list[dict]:
+    """
+    【数据清洗】将多源检索项规整为标准证据字典。
+    """
     evidence = []
     for item in items:
         snippet = str(item.get("snippet") or "").strip()
@@ -61,6 +90,9 @@ def _document_evidence(items: list[dict], default_source_type: str) -> list[dict
 
 
 def _dedupe_evidence(items: list[dict], limit: int) -> list[dict]:
+    """
+    【证据去重】根据 (source_type, source_id, title) 唯一标识符剪除重复条目。
+    """
     output = []
     seen = set()
     for item in items:
@@ -75,6 +107,9 @@ def _dedupe_evidence(items: list[dict], limit: int) -> list[dict]:
 
 
 def _fallback_project_documents(db: Session, repo_id: UUID) -> list[dict]:
+    """
+    【冷启动兜底】向量库无命中时加载最新的通用项目规范文档。
+    """
     rows = (
         db.query(Document)
         .filter(Document.repo_id == repo_id, Document.source_type.in_(PROJECT_DOC_TYPES))
@@ -96,6 +131,9 @@ def _fallback_project_documents(db: Session, repo_id: UUID) -> list[dict]:
 
 
 def _conversation_evidence(db: Session, run: WorkflowRun, conversation_id: UUID | None, query: str) -> list[dict]:
+    """
+    【会话上下文抽取】提取对话中关于 CI 构建相关的讨论记录。
+    """
     if not conversation_id:
         return []
     conversation = db.get(Conversation, conversation_id)
@@ -118,6 +156,9 @@ def _conversation_evidence(db: Session, run: WorkflowRun, conversation_id: UUID 
 
 
 def _ci_plan() -> list[str]:
+    """
+    【规范化大纲】返回 CI 故障 6 步标准排查流程。
+    """
     return [
         "找出失败 job 和失败 step。",
         "提取首个关键错误块。",
@@ -129,6 +170,9 @@ def _ci_plan() -> list[str]:
 
 
 def _workflow_payload(run: WorkflowRun) -> dict:
+    """
+    【载荷转换】将 WorkflowRun ORM 实体解构为 Agent 可读的干净字典。
+    """
     return {
         "id": str(run.id),
         "name": run.name,
@@ -141,6 +185,9 @@ def _workflow_payload(run: WorkflowRun) -> dict:
 
 
 def _failed_jobs(run: WorkflowRun) -> list[dict]:
+    """
+    【故障筛选】从多 Job 执行树中过滤出状态为 failure 的 Job 并提取其失败 Step。
+    """
     return [
         {
             **job,
@@ -152,6 +199,14 @@ def _failed_jobs(run: WorkflowRun) -> list[dict]:
 
 
 def _first_error(logs: str | None) -> str | None:
+    """
+    【日志核心算法】基于特征词和滑动窗口，从冗长构建日志中提取首个致命错误上下文。
+
+    算法原理:
+      1. 逐行扫描日志，寻找特征标识词（error, failed, exception, traceback, assertionerror 等）。
+      2. 命中后以当前行为中心，向前扩展 2 行、向后抓取 5 行，组成高价值错误上下文块。
+      3. 最多截取 900 字符，杜绝超出 Token 限制。
+    """
     if not logs or not logs.strip():
         return None
     lines = [line.strip() for line in logs.splitlines() if line.strip()]
@@ -165,6 +220,11 @@ def _first_error(logs: str | None) -> str | None:
 
 
 def _related_files_from_logs(logs: str | None) -> list[str]:
+    """
+    【正则文件挖掘】从控制台堆栈输出中提取提及的代码文件和配置路径。
+
+    匹配规则: 捕获常见代码与配置扩展名 (`.py`, `.ts`, `.json`, `.yml` 等) 并去除首尾标点。
+    """
     if not logs:
         return []
     candidates = re.findall(r"[\w./\\-]+\.(?:py|ts|tsx|js|jsx|json|ya?ml|toml|ini|cfg|md)", logs)
@@ -177,6 +237,14 @@ def _related_files_from_logs(logs: str | None) -> list[str]:
 
 
 def _related_pr_for_run(db: Session, run: WorkflowRun) -> PullRequest | None:
+    """
+    【智能 PR 溯源】通过工作流日志和分支名称自动关联对应的 Pull Request。
+
+    匹配策略:
+      1. 加载仓库最近活跃的 8 个 PR。
+      2. 检查 PR 的 `head_branch` 是否出现在 CI 任务名称或日志文本中。
+      3. 若未完全匹配，默认关联最近更新的一个 PR 作为分析上下文。
+    """
     candidates = (
         db.query(PullRequest)
         .options(selectinload(PullRequest.files))
@@ -195,6 +263,9 @@ def _related_pr_for_run(db: Session, run: WorkflowRun) -> PullRequest | None:
 
 
 def _snapshot_summary(snapshot: dict) -> dict:
+    """
+    【快照精炼】封装关联 PR 的 Worktree 状态信息。
+    """
     return {
         "status": snapshot.get("status"),
         "message": snapshot.get("message"),
@@ -209,6 +280,9 @@ def _snapshot_summary(snapshot: dict) -> dict:
 
 
 def _prepare_ci_pr_snapshot(db: Session, run: WorkflowRun, enabled: bool) -> dict:
+    """
+    【快照桥接】反查 PR 并准备专属 Worktree 快照。
+    """
     if not enabled:
         return {"status": "skipped", "message": "未请求 PR 分支快照。"}
     repo = db.get(Repository, run.repo_id)
@@ -229,12 +303,16 @@ def _prepare_ci_pr_snapshot(db: Session, run: WorkflowRun, enabled: bool) -> dic
 
 
 def _ci_code_graph_impact(db: Session, pr_id: UUID, related_files: list[str]) -> dict:
+    """
+    【图谱碰撞】查询日志中提及的文件在关联 PR 中涉及的符号与函数调用拓扑。
+    """
     paths = list(dict.fromkeys(related_files))
     symbol_query = db.query(CodeSymbol).filter(CodeSymbol.pr_id == pr_id)
     if paths:
         symbol_query = symbol_query.filter(CodeSymbol.path.in_(paths))
     symbols = symbol_query.order_by(CodeSymbol.path.asc(), CodeSymbol.start_line.asc()).limit(30).all()
     symbol_names = [symbol.name for symbol in symbols]
+
     relation_query = db.query(CodeRelation).filter(CodeRelation.pr_id == pr_id)
     relation_filters = []
     if paths:
@@ -244,6 +322,7 @@ def _ci_code_graph_impact(db: Session, pr_id: UUID, related_files: list[str]) ->
     if relation_filters:
         relation_query = relation_query.filter(or_(*relation_filters))
     relations = relation_query.limit(60).all()
+
     return {
         "related_files": paths[:30],
         "symbols": [
@@ -271,6 +350,9 @@ def _ci_code_graph_impact(db: Session, pr_id: UUID, related_files: list[str]) ->
 
 
 def _augment_ci_context_with_snapshot(db: Session, run: WorkflowRun, query: str, context: dict, counts: dict, snapshot: dict) -> None:
+    """
+    【快照证据合流】将 PR 快照中的相关代码段与受影响符号融入 CI 分析上下文。
+    """
     context["pr_snapshot"] = _snapshot_summary(snapshot)
     counts["snapshot_code"] = 0
     counts["impacted_symbols"] = 0
@@ -309,6 +391,9 @@ def _augment_ci_context_with_snapshot(db: Session, run: WorkflowRun, query: str,
 
 
 def _build_ci_analysis_context(db: Session, run: WorkflowRun, conversation_id: UUID | None = None) -> tuple[str, dict, dict]:
+    """
+    【排查上下文构建器】聚合失败 Job、首个错误块、日志涉事文件、源码引用与 Workflow 配置文件。
+    """
     repo = db.get(Repository, run.repo_id)
     first_error = _first_error(run.logs_text)
     failed_jobs = _failed_jobs(run)
@@ -319,16 +404,23 @@ def _build_ci_analysis_context(db: Session, run: WorkflowRun, conversation_id: U
         if isinstance(step, dict)
     ]
     related_files = _related_files_from_logs(run.logs_text)
+
+    # 构造检索代码与语义向量的查询串
     code_query = "\n".join(
         filter(None, [run.name, run.conclusion or "", first_error or "", run.logs_text[:5000] if run.logs_text else ""])
     )
+    # 脱敏清洗日志（移除 IP、密钥格式字符串）后用于语义向量检索
     semantic_query = sanitize_ci_log(
         "\n".join(filter(None, [run.name, first_error or "", run.logs_text[:3000] if run.logs_text else ""]))
     )
+
+    # 1. 源码检索
     code_docs = _document_evidence(
         search_repository_code(repo, code_query, limit=6) if repo else [],
         "code",
     )
+
+    # 2. 知识库与项目运维文档
     project_docs = _document_evidence(
         search_similar_documents(
             db,
@@ -341,10 +433,14 @@ def _build_ci_analysis_context(db: Session, run: WorkflowRun, conversation_id: U
     )
     if not project_docs:
         project_docs = _fallback_project_documents(db, run.repo_id)
+
+    # 3. GitHub Actions 配置文件检索 (.github/workflows)
     workflow_docs = _document_evidence(
         search_repository_code(repo, run.name, limit=4, relative_path=".github/workflows") if repo else [],
         "workflow",
     )
+
+    # 4. 最近相关的 PR 列表
     recent_prs = [
         {
             "number": pr.number,
@@ -361,7 +457,10 @@ def _build_ci_analysis_context(db: Session, run: WorkflowRun, conversation_id: U
             .all()
         )
     ]
+
+    # 5. 会话上下文
     chat_evidence = _conversation_evidence(db, run, conversation_id, semantic_query)
+
     context = {
         "repo_id": str(run.repo_id),
         "plan": _ci_plan(),
@@ -396,6 +495,9 @@ def _persist_ci_analysis(
     conversation_id: UUID | None,
     evidence_counts: dict,
 ) -> AnalysisResult:
+    """
+    【持久化】将 CI 根因、修复建议与阻塞判断入库保存。
+    """
     analysis = AnalysisResult(
         target_type="workflow_run",
         target_id=run.id,
@@ -415,6 +517,9 @@ def _persist_ci_analysis(
 
 
 def _public_reasoning_fallback(run: WorkflowRun, context: dict, counts: dict) -> list[str]:
+    """
+    【公开推理备用话术】在离线状态下汇报排查步骤。
+    """
     first_error = context.get("first_error") or "日志中没有明确错误块"
     return [
         f"- 我先制定 CI 排查计划，再读取 workflow「{run.name}」的状态、结论、job 和日志。\n",
@@ -426,6 +531,9 @@ def _public_reasoning_fallback(run: WorkflowRun, context: dict, counts: dict) ->
 
 
 async def _stream_public_reasoning(agent: CIDebugAgent, run: WorkflowRun, payload: dict, context: dict, counts: dict) -> AsyncIterator[str]:
+    """
+    【流式执行过程】流式输出 CI 排查思考链路。
+    """
     streamed = False
     user_payload = {
         "workflow_run": payload,
@@ -455,16 +563,24 @@ async def _stream_public_reasoning(agent: CIDebugAgent, run: WorkflowRun, payloa
 
 
 async def _ci_analysis_sse(run_id: UUID, conversation_id: UUID | None, db: Session) -> AsyncIterator[str]:
+    """
+    【SSE 核心生成器】执行 CI 6 步故障诊断全过程并推送流式事件。
+    """
     run = db.get(WorkflowRun, run_id)
     if run is None:
         yield _encode_sse("error", {"message": "未找到 workflow 运行"})
         return
+
     agent = CIDebugAgent()
     payload = _workflow_payload(run)
     plan = _ci_plan()
+
     try:
+        # 发送排查大纲
         yield _encode_sse("trace", _trace_item("step", "制定排查计划", "\n".join(f"{index + 1}. {item}" for index, item in enumerate(plan)), "done"))
         yield _encode_sse("trace", _trace_item("step", "执行 1/6：定位失败 job/step", f"读取 workflow「{run.name}」的 jobs、steps、状态和结论。", "running"))
+        
+        # 关联 PR 快照
         snapshot = _prepare_ci_pr_snapshot(db, run, enabled=True)
         yield _encode_sse(
             "trace",
@@ -474,20 +590,28 @@ async def _ci_analysis_sse(run_id: UUID, conversation_id: UUID | None, db: Sessi
                 str(snapshot.get("message") or f"状态：{snapshot.get('status')}；代码图符号：{snapshot.get('indexed_symbols') or 0}。"),
             ),
         )
+
         _query, context, counts = _build_ci_analysis_context(db, run, conversation_id)
         _augment_ci_context_with_snapshot(db, run, _query, context, counts, snapshot)
         context["plan"] = plan
+
         failed_job_names = [str(job.get("name")) for job in context.get("failed_jobs", []) if job.get("name")]
         yield _encode_sse("trace", _trace_item("tool", "执行 1/6：定位失败 job/step", f"失败 job：{', '.join(failed_job_names[:3]) or '未提供'}；失败 step 数：{counts['failed_steps']}。"))
         yield _encode_sse("trace", _trace_item("tool", "执行 2/6：提取首个错误块", str(context.get("first_error") or "日志中没有提取到明确 error 块。")))
         yield _encode_sse("trace", _trace_item("tool", "执行 3/6：判断失败类型", "根据日志关键词、失败命令和 job/step 名称进行分类。"))
         yield _encode_sse("trace", _trace_item("tool", "执行 4/6：搜索代码和配置", f"找到 {counts['code']} 条代码线索，其中 PR 快照代码 {counts.get('snapshot_code', 0)} 条；workflow 配置线索 {counts['workflow']} 条、日志文件路径 {counts['related_files']} 个。"))
         yield _encode_sse("trace", _trace_item("tool", "执行 5/6：关联最近 PR", f"读取最近 PR {counts['recent_prs']} 条，会话证据 {counts['conversation']} 条。"))
+
+        # 流式透明推导演示
         yield _encode_sse("trace", _trace_item("thinking", "LLM 公开排查过程", "开始综合失败日志、代码配置、最近 PR 和项目文档。", "running"))
         async for chunk in _stream_public_reasoning(agent, run, payload, context, counts):
             yield _encode_sse("thinking_delta", {"content": chunk})
+
+        # 执行 Agent 诊断
         result = await agent.run(payload, context)
         analysis = _persist_ci_analysis(db, run, result, agent.llm.model, conversation_id, counts)
+
+        # 汇报根因判定
         yield _encode_sse("trace", _trace_item("result", "执行 6/6：输出根因和阻塞判断", f"失败类型：{result.get('failure_type')}；阻塞合并：{'是' if result.get('is_merge_blocking') else '否'}。"))
         yield _encode_sse("final", {"analysis_id": str(analysis.id), "result": result})
     except Exception as exc:
@@ -497,11 +621,17 @@ async def _ci_analysis_sse(run_id: UUID, conversation_id: UUID | None, db: Sessi
 
 @router.get("/repos/{repo_id}/workflow-runs", response_model=list[WorkflowRunResponse])
 async def list_workflow_runs(repo_id: UUID, db: Session = Depends(get_db)) -> list[WorkflowRun]:
+    """
+    【API 接口】查询指定仓库的所有 CI 工作流运行记录（按创建时间倒序）。
+    """
     return db.query(WorkflowRun).filter(WorkflowRun.repo_id == repo_id).order_by(WorkflowRun.created_at.desc()).all()
 
 
 @router.get("/workflow-runs/{run_id}", response_model=WorkflowRunResponse)
 async def get_workflow_run(run_id: UUID, db: Session = Depends(get_db)) -> WorkflowRun:
+    """
+    【API 接口】获取单个 CI 工作流运行记录详情。
+    """
     run = db.get(WorkflowRun, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="未找到 workflow 运行")
@@ -510,6 +640,9 @@ async def get_workflow_run(run_id: UUID, db: Session = Depends(get_db)) -> Workf
 
 @router.get("/workflow-runs/{run_id}/failed-jobs")
 async def get_failed_jobs(run_id: UUID, db: Session = Depends(get_db)) -> dict:
+    """
+    【API 接口】快速筛选当前工作流中所有状态为 failure 的 Job 及具体失败 Steps。
+    """
     run = db.get(WorkflowRun, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="未找到 workflow 运行")
@@ -531,6 +664,9 @@ async def analyze_workflow_run(
     use_pr_snapshot: bool = Query(default=True),
     db: Session = Depends(get_db),
 ) -> CIAnalysisResponse:
+    """
+    【API 接口 - 同步阻塞】对 CI 失败运行进行全量诊断，返回错误根因、修复计划与阻塞性判断。
+    """
     run = db.get(WorkflowRun, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="未找到 workflow 运行")
@@ -549,4 +685,8 @@ async def analyze_workflow_run_stream(
     conversation_id: UUID | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
+    """
+    【API 接口 - SSE 流式传输】通过 Server-Sent Events 实时推送 CI 诊断推导过程。
+    """
     return StreamingResponse(_ci_analysis_sse(run_id, conversation_id, db), media_type="text/event-stream")
+

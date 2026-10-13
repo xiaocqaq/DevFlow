@@ -1,3 +1,10 @@
+"""技能注册表与清单管理模块.
+
+本模块负责扫描并解析系统内各技能包（Skill Bundles），读取其 `SKILL.md`
+中的 YAML Frontmatter 头部元数据（SkillManifest）与执行指令，
+为智能体（Agent）提供动态工具能力发现与上下文指引。
+"""
+
 import ast
 import hashlib
 import re
@@ -9,10 +16,19 @@ from pydantic import BaseModel, Field
 
 
 class SkillRegistryError(ValueError):
+    """技能解析与注册异常类."""
+
     pass
 
 
 class SkillManifest(BaseModel):
+    """技能清单定义模型 (Pydantic Schema).
+
+    【Python / Pydantic 语法要点】:
+    - 严格遵循声明式模式；
+    - `Field(default_factory=list)`: 自动为列表属性分配独立默认实例。
+    """
+
     name: str
     title: str
     version: str
@@ -25,6 +41,7 @@ class SkillManifest(BaseModel):
     workflow_steps: list[str] = Field(default_factory=list)
     output_contract: str = "freeform"
     safety_level: str = "read_only"
+
 
 
 class SkillDefinition(BaseModel):

@@ -1,3 +1,9 @@
+"""工作流综合汇报智能体模块.
+
+本模块负责汇聚各 Agent 的执行结果与 Observer 的质量审查结论，
+最终输出一份结构清晰、具备工程决策依据的 Markdown 格式备忘录。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -7,11 +13,20 @@ from app.services.agents.base import BaseAgent
 
 
 class SynthesisAgent(BaseAgent):
+    """工作流结果综合智能体 (Synthesis Agent).
+
+    【Python 语法要点 - 字符串格式化与文本拼装】:
+    - 浮点数格式化 `f"{observation.overall_confidence:.2f}"` 保留两位小数；
+    - 使用列表收集行内容 `lines.append(...)` 后通过 `"\n".join(lines)` 统一拼接，
+      相比使用 `+` 频繁拼接字符串具备更优的时间复杂度（O(N) vs O(N^2)）。
+    """
+
     name = "synthesis_agent"
     description = "将多 Agent 工作流综合成一份工程决策备忘录。"
     available_tools = ["synthesize_workflow_report"]
 
     async def run(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """综合多 Agent 产出生成最终结论回答."""
         spec = WorkflowSpec.model_validate(input_data["spec"])
         results = [WorkflowTaskResult.model_validate(item) for item in input_data.get("task_results") or []]
         observation = WorkflowObservation.model_validate(input_data["observation"])

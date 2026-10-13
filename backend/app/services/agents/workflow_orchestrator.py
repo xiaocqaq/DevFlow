@@ -1,3 +1,10 @@
+"""多智能体工程工作流编排器模块.
+
+本模块负责根据规划器（Planner）生成的任务依赖图（DAG），
+调度并执行各专门 Agent，通过观察器（Observer）评估完成质量，
+触发动态重规划（Replan），最终由综合器（Synthesis）汇总生成最终决策报告。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,10 +21,21 @@ from app.services.agents.planner_agent import PlannerAgent
 from app.services.agents.synthesis_agent import SynthesisAgent
 
 
+# 【Python 语法要点 - 高阶类型别名 (Higher-order Type Alias)】:
+# 使用 `Callable[[Arg1, Arg2, ...], ReturnType]` 声明函数类型签名；
+# 嵌套 `Awaitable[...]` 表示该执行器为一个异步协程函数。
 WorkflowTaskRunner = Callable[[WorkflowTask, WorkflowSpec, dict[str, Any]], Awaitable[WorkflowTaskResult | dict[str, Any]]]
 
 
 class WorkflowOrchestrator(BaseAgent):
+    """工程工作流编排器 (Workflow Orchestrator).
+
+    【Python 语法要点 - 依赖注入与默认参数优雅降级】:
+    - `__init__` 中使用 `planner or PlannerAgent()` 模式：
+      若调用方传入自定义 Agent 实例则使用注入的实例（方便写单元测试 Mock），
+      若未传（None）则自动回退到默认实例。
+    """
+
     name = "workflow_orchestrator"
     description = "协调 Planner、专用 Agent、Observer 和 Synthesis 完成工程决策。"
     available_tools = ["run_engineering_workflow"]
@@ -35,6 +53,15 @@ class WorkflowOrchestrator(BaseAgent):
         self.synthesizer = synthesizer or SynthesisAgent()
 
     async def run(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """执行编排任务（先规划后执行）.
+
+        Args:
+            input_data: 包含目标、用户意图及上下文标记的字典。
+            context: 运行时上下文环境。
+
+        Returns:
+            dict[str, Any]: 最终综合报告字典。
+        """
         spec_data = await self.planner.run(input_data, context)
         return await self.run_spec(spec_data, context)
 
@@ -43,6 +70,7 @@ class WorkflowOrchestrator(BaseAgent):
         spec_data: WorkflowSpec | dict[str, Any],
         context: dict[str, Any],
         *,
+
         allow_replan: bool = True,
     ) -> dict[str, Any]:
         started = time.perf_counter()
@@ -157,6 +185,13 @@ class WorkflowOrchestrator(BaseAgent):
         context: dict[str, Any],
         previous_results: list[WorkflowTaskResult] | None = None,
     ) -> list[WorkflowTaskResult]:
+        """按有向无环图（DAG）拓扑依赖并行调度执行任务批次.
+
+        【Python 语法要点 - 拓扑排序与异步并发 (Topological Sort & asyncio.gather)】:
+        1. 依赖驱动循环：每一轮迭代计算满足执行条件的就绪任务（`all(dep in completed)`）；
+        2. 批次并发切片：`ready[: spec.max_parallel_tasks]` 控制最大并发度；
+        3. `asyncio.gather(*tasks)`: 聚合一组协程并发执行，统一等待全部完成后解包返回。
+        """
         pending = {task.id: task for task in spec.tasks}
         completed: dict[str, WorkflowTaskResult] = {
             result.task_id: result

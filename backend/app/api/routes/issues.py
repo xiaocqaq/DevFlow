@@ -1,3 +1,20 @@
+# ==============================================================================
+# 模块名称: Issue 智能分析与排查路由 (Issue Agent API & Streaming Analysis)
+# 架构定位: Web 接口层 (API Routes Layer) / 智能体业务交互端点
+# 核心业务与技术架构:
+#   1. 多源证据融合 (Multi-Source Evidence Aggregation):
+#      分析 Issue 时自动并行/串行聚合：
+#        - 向量库中相似的历史 Issue（判重、关联历史方案）。
+#        - 仓库源码上下文（基于关键词/ripgrep检索受影响代码段）。
+#        - 团队画像与技能矩阵（精准建议 Issue 负责人）。
+#        - 当前对话上下文记忆。
+#   2. 渐进式实时推理流 (Streaming Public Reasoning via SSE):
+#      通过 Server-Sent Events (text/event-stream) 分布式推送 Agent 分析轨迹 (`trace`)、
+#      透明推理增量 (`thinking_delta`) 以及最终结构化分析报告 (`final`)。
+#   3. 分析结果不可变持久化:
+#      所有分析结论存档至 `AnalysisResult` 表，记录输入快照与所用模型，供后续溯源与评测。
+# ==============================================================================
+
 import asyncio
 import json
 from collections.abc import AsyncIterator
@@ -15,9 +32,13 @@ from app.services.chat_memory import ContextAssembler
 from app.services.code_search import search_repository_code
 from app.services.rag.retrieval import search_similar_documents
 
+# 路由子模块
 router = APIRouter()
 
+# 允许作为参考项目文档的数据源类型
 PROJECT_DOC_TYPES = {"knowledge_file", "memory_note", "project_doc"}
+
+# 引导 LLM 输出面向用户的可解释性分析摘要（非内部链式黑盒）
 PUBLIC_REASONING_PROMPT = """
 你是 DevFlow AI 的 Issue Agent。请用中文流式输出一段“公开分析过程”，帮助用户理解你如何分析当前 Issue。
 要求：
@@ -29,10 +50,20 @@ PUBLIC_REASONING_PROMPT = """
 
 
 def _encode_sse(event: str, data: dict) -> str:
+    """
+    【协议编码器】将事件名与数据字典打包为标准 SSE (Server-Sent Events) 数据帧。
+
+    格式规范:
+      event: <event_name>\n
+      data: <json_string>\n\n
+    """
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _document_evidence(items: list[dict], default_source_type: str) -> list[dict]:
+    """
+    【数据清洗与归一化】将不同检索源返回的异构数据统一格式化为标准证据字典列表。
+    """
     evidence = []
     for item in items:
         snippet = str(item.get("snippet") or "").strip()
@@ -53,6 +84,9 @@ def _document_evidence(items: list[dict], default_source_type: str) -> list[dict
 
 
 def _fallback_project_documents(db: Session, repo_id: UUID) -> list[dict]:
+    """
+    【冷启动兜底】当向量检索未命中任何项目文档时，直接从数据库加载最新的 4 篇文档作为通用背景。
+    """
     rows = (
         db.query(Document)
         .filter(Document.repo_id == repo_id, Document.source_type.in_(PROJECT_DOC_TYPES))
@@ -74,6 +108,9 @@ def _fallback_project_documents(db: Session, repo_id: UUID) -> list[dict]:
 
 
 def _conversation_evidence(db: Session, issue: Issue, conversation_id: UUID | None, query: str) -> list[dict]:
+    """
+    【上下文集成】提取当前对话历史及记忆沉淀作为分析线索。
+    """
     if not conversation_id:
         return []
     conversation = db.get(Conversation, conversation_id)
@@ -96,6 +133,9 @@ def _conversation_evidence(db: Session, issue: Issue, conversation_id: UUID | No
 
 
 def _issue_payload(issue: Issue) -> dict:
+    """
+    【视图转换】提取 Issue 实体的核心业务属性并转化为标准 JSON 兼容字典。
+    """
     return {
         "id": str(issue.id),
         "title": issue.title,
@@ -109,8 +149,18 @@ def _issue_payload(issue: Issue) -> dict:
 
 
 def _build_issue_analysis_context(db: Session, issue: Issue, conversation_id: UUID | None = None) -> tuple[str, dict, dict]:
+    """
+    【核心上下文编排器】全方位搜集当前 Issue 的所有关联线索（向量判重、源码引用、项目背景、团队画像）。
+
+    返回值说明:
+      - `query`: 综合标题和正文的搜索串。
+      - `context`: 包含 duplicate_candidates, code_references, project_documents, team_members 的大字典。
+      - `counts`: 各类型证据命中条数统计（用于快照与监控打点）。
+    """
     query = f"{issue.title}\n{issue.body or ''}"
     repo = db.get(Repository, issue.repo_id)
+
+    # 1. 向量相似度检索：寻找相似历史 Issue（判重检测）
     similar_docs = search_similar_documents(db, str(issue.repo_id), query, "issue", 4)
     duplicates = [
         {
@@ -121,10 +171,14 @@ def _build_issue_analysis_context(db: Session, issue: Issue, conversation_id: UU
         for item in similar_docs
         if item["source_id"] != str(issue.id)
     ]
+
+    # 2. 源码检索：根据 Issue 报错关键词搜寻本地工作区代码
     code_docs = _document_evidence(
         search_repository_code(repo, query, limit=4) if repo else [],
         "code",
     )
+
+    # 3. 知识库与项目规范检索
     project_docs = _document_evidence(
         search_similar_documents(
             db,
@@ -137,7 +191,11 @@ def _build_issue_analysis_context(db: Session, issue: Issue, conversation_id: UU
     )
     if not project_docs:
         project_docs = _fallback_project_documents(db, issue.repo_id)
+
+    # 4. 当前会话上下文证据
     chat_evidence = _conversation_evidence(db, issue, conversation_id, query)
+
+    # 5. 团队技能画像：根据文档中维护的开发者专长信息辅助建议负责人
     team_members = [
         {
             "name": (doc.meta or {}).get("name") or doc.title.replace("团队成员：", "").replace("Team member: ", ""),
@@ -147,6 +205,7 @@ def _build_issue_analysis_context(db: Session, issue: Issue, conversation_id: UU
         }
         for doc in db.query(Document).filter(Document.repo_id == issue.repo_id, Document.source_type == "team_member").all()
     ]
+
     context = {
         "repo_id": str(issue.repo_id),
         "duplicate_candidates": duplicates,
@@ -173,6 +232,9 @@ def _persist_issue_analysis(
     conversation_id: UUID | None,
     evidence_counts: dict,
 ) -> AnalysisResult:
+    """
+    【持久化】将 Agent 分析出的结论、证据清单及输入快照存入 AnalysisResult 表。
+    """
     analysis = AnalysisResult(
         target_type="issue",
         target_id=issue.id,
@@ -192,10 +254,16 @@ def _persist_issue_analysis(
 
 
 def _trace_item(kind: str, title: str, content: str, status: str = "done") -> dict:
+    """
+    【辅助方法】构造前端执行链路时间线节点（Step/Tool/Thinking/Result）。
+    """
     return {"kind": kind, "title": title, "content": content, "status": status}
 
 
 def _public_reasoning_fallback(issue: Issue, context: dict) -> list[str]:
+    """
+    【离线降级话术】当 LLM 流式文本接口未能成功输出时，生成基于事实统计的透明分析过程。
+    """
     duplicates = context.get("duplicate_candidates") or []
     code_refs = context.get("code_references") or []
     docs = context.get("project_documents") or []
@@ -210,6 +278,9 @@ def _public_reasoning_fallback(issue: Issue, context: dict) -> list[str]:
 
 
 async def _stream_public_reasoning(agent: IssueAgent, issue: Issue, payload: dict, context: dict) -> AsyncIterator[str]:
+    """
+    【异步生成器】流式输出面向用户的公开推理过程（优先调用模型流式，失败自动回退）。
+    """
     streamed = False
     user_payload = {
         "issue": payload,
@@ -227,39 +298,64 @@ async def _stream_public_reasoning(agent: IssueAgent, issue: Issue, payload: dic
             "team_members": context.get("team_members", [])[:3],
         },
     }
+    # 尝试模型流式吐字
     async for chunk in agent.llm.chat_text_stream(
         PUBLIC_REASONING_PROMPT,
         [{"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}],
     ):
         streamed = True
         yield chunk
+
     if streamed:
         return
+
+    # 若未吐字，启动平滑回退
     for line in _public_reasoning_fallback(issue, context):
         await asyncio.sleep(0.06)
         yield line
 
 
 async def _issue_analysis_sse(issue_id: UUID, conversation_id: UUID | None, db: Session) -> AsyncIterator[str]:
+    """
+    【SSE 核心生成器】端到端驱动 Issue 智能分析生命周期并按需向前端推送 SSE 帧。
+
+    事件流生命周期:
+      1. `trace` (step: reading) -> 读取基础数据
+      2. `trace` (tools) -> 检索相似 Issue、代码与团队画像
+      3. `thinking_delta` -> 实时流式输出 LLM 的分析思路
+      4. `agent.run()` -> 生成高置信度 JSON 分析结果并保存入库
+      5. `final` -> 发送最终分析结果与生成的 analysis_id
+    """
     issue = db.get(Issue, issue_id)
     if issue is None:
         yield _encode_sse("error", {"message": "未找到 Issue"})
         return
+
     agent = IssueAgent()
     payload = _issue_payload(issue)
+
     try:
+        # 发送起始追踪节点
         yield _encode_sse("trace", _trace_item("step", "读取 Issue", f"读取 Issue #{issue.number} 的标题、正文、标签、状态和已分配人员。", "running"))
         query, context, counts = _build_issue_analysis_context(db, issue, conversation_id)
+        
+        # 汇报证据搜集进展
         yield _encode_sse("trace", _trace_item("tool", "检索相似历史", f"找到 {counts['duplicates']} 个相似 Issue 候选。"))
         yield _encode_sse("trace", _trace_item("tool", "检索代码与文档", f"找到 {counts['code']} 条代码线索、{counts['documents']} 条项目文档/记忆线索。"))
         yield _encode_sse("trace", _trace_item("tool", "读取团队画像", f"读取 {counts['team_members']} 位团队成员，用于建议负责人。"))
         if counts["conversation"]:
             yield _encode_sse("trace", _trace_item("tool", "读取会话上下文", f"找到 {counts['conversation']} 条与当前会话相关的证据。"))
+
+        # 开始流式透明思考
         yield _encode_sse("trace", _trace_item("thinking", "LLM 公开分析过程", "开始综合 Issue、证据和团队画像。", "running"))
         async for chunk in _stream_public_reasoning(agent, issue, payload, context):
             yield _encode_sse("thinking_delta", {"content": chunk})
+
+        # 执行 Agent 结构化推导与结果落库
         result = await agent.run(payload, context)
         analysis = _persist_issue_analysis(db, issue, result, agent.llm.model, conversation_id, counts)
+
+        # 发送完成事件与最终报告
         yield _encode_sse("trace", _trace_item("result", "生成结构化结论", f"结论：{result.get('conclusion')}；优先级：{result.get('priority')}；复杂度：{result.get('complexity')}；负责人：{result.get('suggested_owner')}。"))
         yield _encode_sse("final", {"analysis_id": str(analysis.id), "result": result})
     except Exception as exc:
@@ -269,11 +365,17 @@ async def _issue_analysis_sse(issue_id: UUID, conversation_id: UUID | None, db: 
 
 @router.get("/repos/{repo_id}/issues", response_model=list[IssueResponse])
 async def list_issues(repo_id: UUID, db: Session = Depends(get_db)) -> list[Issue]:
+    """
+    【API 接口】获取仓库的所有 Issue 列表（按编号倒序）。
+    """
     return db.query(Issue).filter(Issue.repo_id == repo_id).order_by(Issue.number.desc()).all()
 
 
 @router.get("/issues/{issue_id}", response_model=IssueResponse)
 async def get_issue(issue_id: UUID, db: Session = Depends(get_db)) -> Issue:
+    """
+    【API 接口】获取单个 Issue 的详情。
+    """
     issue = db.get(Issue, issue_id)
     if issue is None:
         raise HTTPException(status_code=404, detail="未找到 Issue")
@@ -286,6 +388,9 @@ async def analyze_issue(
     conversation_id: UUID | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> IssueAnalysisResponse:
+    """
+    【API 接口 - 同步阻塞模式】对指定 Issue 进行全量分析并直接返回分析报告。
+    """
     issue = db.get(Issue, issue_id)
     if issue is None:
         raise HTTPException(status_code=404, detail="未找到 Issue")
@@ -302,12 +407,19 @@ async def analyze_issue_stream(
     conversation_id: UUID | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
+    """
+    【API 接口 - SSE 流式模式】通过 Server-Sent Events 流式返回思考过程与分析阶段结论。
+    """
     return StreamingResponse(_issue_analysis_sse(issue_id, conversation_id, db), media_type="text/event-stream")
 
 
 @router.get("/issues/{issue_id}/similar")
 async def similar_issues(issue_id: UUID, db: Session = Depends(get_db)) -> list[dict]:
+    """
+    【API 接口】基于向量特征检索与当前 Issue 语义相似的 Top-5 历史 Issue。
+    """
     issue = db.get(Issue, issue_id)
     if issue is None:
         raise HTTPException(status_code=404, detail="未找到 Issue")
     return search_similar_documents(db, str(issue.repo_id), f"{issue.title}\n{issue.body or ''}", "issue", 5)
+

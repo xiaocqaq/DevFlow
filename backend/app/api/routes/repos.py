@@ -1,3 +1,9 @@
+"""代码仓库管理与同步 API 路由模块.
+
+本模块提供代码仓库的接入（Connect，支持本地路径与远程 GitHub 托管）、
+元数据同步（Sync）、状态轮询与删除（Delete）接口。
+"""
+
 import os
 import re
 import subprocess
@@ -29,6 +35,14 @@ GITHUB_HOSTS = {"github.com", "www.github.com"}
 
 @dataclass(frozen=True)
 class GitRemoteInfo:
+    """Git 远端仓库元数据容器类.
+
+    【Python 语法要点 - 不可变数据类 (Immutable Dataclass)】:
+    - `@dataclass(frozen=True)`:
+      属性在初始化赋值后处于只读锁定状态（无法执行 `info.owner = ...`，否则引发 FrozenInstanceError）；
+      内部自动实现 `__hash__` 方法，支持放入 set 集合中去重或作为字典键使用。
+    """
+
     owner: str
     repo: str
     clone_url: str
@@ -37,6 +51,7 @@ class GitRemoteInfo:
 
 
 def _clean_text(value: str | None) -> str | None:
+    """去除首尾多余空格并将纯空字符串转换为 None."""
     if value is None:
         return None
     cleaned = value.strip()
@@ -44,6 +59,14 @@ def _clean_text(value: str | None) -> str | None:
 
 
 def _resolve_user_path(raw_path: str, field_name: str) -> Path:
+    """解析并标准化用户输入的本地路径字符串.
+
+    【Python 语法要点 - 路径解析与标准化】:
+    1. 去除首尾引号；
+    2. `os.path.expandvars`: 展开系统环境变量（如 Windows `%USERPROFILE%` 或 Linux `$HOME`）；
+    3. `os.path.expanduser`: 将波浪号 `~` 展开为当前用户主目录；
+    4. `path.resolve()`: 解析符号链接并将相对路径转为绝对路径（Absolute Canonical Path）。
+    """
     cleaned = raw_path.strip().strip('"').strip("'")
     if not cleaned:
         raise HTTPException(status_code=400, detail=f"{field_name} cannot be empty.")
@@ -55,6 +78,7 @@ def _resolve_user_path(raw_path: str, field_name: str) -> Path:
 
 
 def _git_output(args: list[str], cwd: Path) -> str:
+    """执行底层 git 命令并返回标准输出去除首尾空白后的文本."""
     try:
         result = subprocess.run(
             ["git", *args],
@@ -74,9 +98,17 @@ def _git_output(args: list[str], cwd: Path) -> str:
 
 
 def _parse_git_remote_url(remote_url: str) -> GitRemoteInfo:
+    """解析 Git 远端地址（支持 SSH/SCP 格式与标准 HTTP(S) URL 格式）.
+
+    【Python 语法要点 - 正则命名捕获组与 URL 解析】:
+    - 命名捕获组 `(?P<host>[^:]+)`：直接通过 `match.group("host")` 按名提取；
+    - 分支处理：优先识别 SSH 格式（`git@github.com:owner/repo.git`），
+      若包含协议头（`https://`）则使用标准库 `urllib.parse.urlparse` 解析。
+    """
     value = remote_url.strip()
     host: str | None = None
     path = ""
+    # 匹配类似 git@github.com:owner/repo.git 的 SCP 风格语法
     scp_like = re.match(r"^(?:[^@]+@)?(?P<host>[^:]+):(?P<path>.+)$", value)
 
     if scp_like and "://" not in value:
@@ -87,11 +119,13 @@ def _parse_git_remote_url(remote_url: str) -> GitRemoteInfo:
         host = parsed.hostname or parsed.netloc or None
         path = parsed.path
 
+    # 将路径按斜杠切分获取 owner 与 repo
     parts = [item.strip() for item in path.replace("\\", "/").strip("/").split("/") if item.strip()]
     if len(parts) < 2:
         raise HTTPException(status_code=400, detail=f"Cannot parse owner/repository from git remote URL: {remote_url}")
 
     owner = parts[-2]
+    # 去除末尾的 .git 后缀
     repo = re.sub(r"\.git$", "", parts[-1], flags=re.IGNORECASE)
     if not owner or not repo:
         raise HTTPException(status_code=400, detail=f"Cannot parse owner/repository from git remote URL: {remote_url}")
@@ -99,10 +133,12 @@ def _parse_git_remote_url(remote_url: str) -> GitRemoteInfo:
 
 
 def _inspect_local_repository(raw_path: str) -> tuple[Path, GitRemoteInfo]:
+    """探测并读取本地已有 Git 仓库的元数据（包括当前分支与远程源地址）."""
     path = _resolve_user_path(raw_path, "local_path")
     if not path.exists() or not path.is_dir():
         raise HTTPException(status_code=400, detail=f"Local repository path does not exist or is not a directory: {path}")
 
+    # 验证是否处于 Git 仓库工作区内部
     inside_work_tree = _git_output(["rev-parse", "--is-inside-work-tree"], path).lower()
     if inside_work_tree != "true":
         raise HTTPException(status_code=400, detail=f"Local path is not inside a git repository: {path}")
@@ -121,6 +157,7 @@ def _inspect_local_repository(raw_path: str) -> tuple[Path, GitRemoteInfo]:
 
 
 def _infer_provider(requested_provider: str | None, remote_host: str | None) -> str:
+    """根据主机域名推导服务商类型（如识别企业自建 GitHub Enterprise）."""
     provider = requested_provider or "github"
     if remote_host and remote_host not in GITHUB_HOSTS and provider == "github":
         return "github_compatible"
@@ -128,6 +165,7 @@ def _infer_provider(requested_provider: str | None, remote_host: str | None) -> 
 
 
 def _effective_api_base_url(provider: str, raw_base_url: str | None, remote_host: str | None) -> str | None:
+    """计算最终生效的 API 请求端点基地址."""
     if provider == "github":
         return "https://api.github.com"
     base_url = _clean_text(raw_base_url)
@@ -139,6 +177,7 @@ def _effective_api_base_url(provider: str, raw_base_url: str | None, remote_host
 
 
 def _clone_target_from_parent(raw_parent: str, repo_name: str) -> Path:
+    """计算远程代码库准备克隆到的本地目标父目录."""
     parent = _resolve_user_path(raw_parent, "clone_parent_dir")
     if parent.exists() and not parent.is_dir():
         raise HTTPException(status_code=400, detail=f"Download parent path is not a directory: {parent}")
@@ -156,6 +195,14 @@ def _clone_target_from_parent(raw_parent: str, repo_name: str) -> Path:
 
 @router.post("/connect", response_model=RepoConnectResponse)
 async def connect_repo(payload: RepoConnectRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)) -> RepoConnectResponse:
+    """接入新代码仓库主接口（支持本地路径与远程克隆）.
+
+    【FastAPI / 异步架构要点】:
+    1. 请求参数校验与本地 Git 探测；
+    2. 加密存储敏感 Token（`encrypt_token`）；
+    3. 数据库插入或更新仓库记录；
+    4. 同步元数据并利用 `background_tasks.add_task` 异步触发耗时的代码静态分析。
+    """
     local_path = _clean_text(payload.local_path)
     clone_parent_dir = _clean_text(payload.clone_parent_dir)
     owner = _clean_text(payload.owner)
@@ -166,6 +213,7 @@ async def connect_repo(payload: RepoConnectRequest, background_tasks: Background
     checkout_mode = "managed"
     remote_info: GitRemoteInfo | None = None
 
+    # 本地目录接入处理
     if local_path:
         checkout_path, remote_info = _inspect_local_repository(local_path)
         owner = remote_info.owner
@@ -194,6 +242,8 @@ async def connect_repo(payload: RepoConnectRequest, background_tasks: Background
         "default_branch": remote_info.default_branch if remote_info and remote_info.default_branch else "main",
         "clone_url": remote_info.clone_url if remote_info else f"https://github.com/{owner}/{repo_name}.git",
     }
+    
+    # 非演示模式下通过 GitHub 客户端校验远程仓库连通性
     if not payload.demo_mode:
         try:
             repo_data = await GitHubClient(token, base_url).get_repo(owner or "", repo_name or "")
@@ -206,6 +256,7 @@ async def connect_repo(payload: RepoConnectRequest, background_tasks: Background
                 "Added the repository in local cache mode; add a token or retry later for full GitHub sync."
             )
 
+    # 查重并保存 ORM 记录
     repo = db.query(Repository).filter(Repository.full_name == full_name).one_or_none()
     if repo is None:
         repo = Repository(owner=owner or "", name=repo_name or "", full_name=full_name)
@@ -224,6 +275,8 @@ async def connect_repo(payload: RepoConnectRequest, background_tasks: Background
     repo.github_id = repo_data.get("id")
     db.commit()
     db.refresh(repo)
+
+    # 触发初始同步并调度后台代码分析任务
     sync_result: RepoSyncResponse | None = None
     if not effective_demo_mode:
         sync_result = await sync_repository(
@@ -236,9 +289,11 @@ async def connect_repo(payload: RepoConnectRequest, background_tasks: Background
                 limit=payload.initial_sync_limit,
             ),
         )
+        # BackgroundTasks: 将代码克隆与语义分析派发给后台异步线程执行，立即向前端返回响应
         background_tasks.add_task(sync_repository_code_analysis_by_id, repo.id)
     elif fallback_message:
         background_tasks.add_task(sync_repository_code_analysis_by_id, repo.id)
+
     return RepoConnectResponse(
         repo_id=repo.id,
         full_name=repo.full_name,
@@ -265,6 +320,7 @@ async def connect_repo(payload: RepoConnectRequest, background_tasks: Background
 
 @router.get("", response_model=list[RepoResponse])
 async def list_repos(db: Session = Depends(get_db)) -> list[Repository]:
+    """查询当前已连接的所有仓库列表（按最后更新时间倒序排序）."""
     return (
         db.query(Repository)
         .filter(Repository.provider != "knowledge_base")
@@ -280,6 +336,7 @@ async def sync_repo(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> RepoSyncResponse:
+    """手动触发指定仓库的数据同步."""
     repo = db.get(Repository, repo_id)
     if repo is None:
         raise HTTPException(status_code=404, detail="未找到仓库")
@@ -290,6 +347,7 @@ async def sync_repo(
 
 @router.post("/{repo_id}/select")
 async def select_repo(repo_id: UUID, db: Session = Depends(get_db)) -> dict:
+    """将指定仓库标记为当前活动工作仓库（更新其 updated_at 时间戳）."""
     repo = db.get(Repository, repo_id)
     if repo is None:
         raise HTTPException(status_code=404, detail="未找到仓库")
@@ -300,10 +358,20 @@ async def select_repo(repo_id: UUID, db: Session = Depends(get_db)) -> dict:
 
 @router.delete("/{repo_id}")
 async def delete_repo(repo_id: UUID, db: Session = Depends(get_db)) -> dict:
+    """彻底删除仓库及其下属所有关联数据（全量级联清理）.
+
+    【工程架构要点 - 跨系统分布式资源安全清理】:
+    1. 收集下级关联实体主键集合（Issue、PR、CI、对话、工作流）；
+    2. PostgreSQL 关系表级联批量清理（避免外键约束报错）；
+    3. Milvus 向量数据库文档切片清理（`delete_milvus_documents`）；
+    4. 本地存储的原文档物理文件删除（`path.unlink()`）；
+    5. 工作区依赖 JSON 数组更新。
+    """
     repo = db.get(Repository, repo_id)
     if repo is None:
         raise HTTPException(status_code=404, detail="未找到仓库")
 
+    # 预先查询相关 ID 列表
     issue_ids = [item.id for item in db.query(Issue.id).filter(Issue.repo_id == repo.id).all()]
     pr_ids = [item.id for item in db.query(PullRequest.id).filter(PullRequest.repo_id == repo.id).all()]
     run_ids = [item.id for item in db.query(WorkflowRun.id).filter(WorkflowRun.repo_id == repo.id).all()]
@@ -331,6 +399,7 @@ async def delete_repo(repo_id: UUID, db: Session = Depends(get_db)) -> dict:
         .all()
     ]
 
+    # 清理分析快照结果
     for target_type, ids in [
         ("issue", issue_ids),
         ("pull_request", pr_ids),
@@ -342,6 +411,7 @@ async def delete_repo(repo_id: UUID, db: Session = Depends(get_db)) -> dict:
                 AnalysisResult.target_id.in_(ids),
             ).delete(synchronize_session=False)
 
+    # 记录物理磁盘存储的文件路径供后续清理
     knowledge_sources = (
         db.query(KnowledgeSourceDocument)
         .filter(KnowledgeSourceDocument.repo_id == repo.id)
@@ -349,6 +419,7 @@ async def delete_repo(repo_id: UUID, db: Session = Depends(get_db)) -> dict:
     )
     stored_paths = [Path(source.stored_path) for source in knowledge_sources]
 
+    # 级联删除关联数据表
     if pr_ids:
         db.query(PRFile).filter(PRFile.pr_id.in_(pr_ids)).delete(synchronize_session=False)
         db.query(PRReviewComment).filter(PRReviewComment.pr_id.in_(pr_ids)).delete(synchronize_session=False)
@@ -419,14 +490,20 @@ async def delete_repo(repo_id: UUID, db: Session = Depends(get_db)) -> dict:
     db.query(Issue).filter(Issue.repo_id == repo.id).delete(synchronize_session=False)
     db.query(PullRequest).filter(PullRequest.repo_id == repo.id).delete(synchronize_session=False)
     db.query(WorkflowRun).filter(WorkflowRun.repo_id == repo.id).delete(synchronize_session=False)
+    
+    # 从关联工作区列表中移除当前仓库 ID
     for workspace in db.query(Workspace).all():
         next_repo_ids = [item for item in (workspace.repo_ids or []) if str(item) != str(repo.id)]
         if next_repo_ids != (workspace.repo_ids or []):
             workspace.repo_ids = next_repo_ids
+    
     db.delete(repo)
     db.commit()
 
+    # 清理外部 Milvus 向量集合中的相关切片
     milvus_deleted = delete_milvus_documents(repo_id=repo.id, strict=False)
+    
+    # 物理删除本地磁盘存储的文件
     removed_files = 0
     file_cleanup_errors: list[str] = []
     for path in stored_paths:
@@ -450,6 +527,7 @@ async def delete_repo(repo_id: UUID, db: Session = Depends(get_db)) -> dict:
 
 @router.get("/{repo_id}/sync-status")
 async def sync_status(repo_id: UUID, db: Session = Depends(get_db)) -> dict:
+    """查询指定仓库最新的同步运行状态与时间戳."""
     repo = db.get(Repository, repo_id)
     if repo is None:
         raise HTTPException(status_code=404, detail="未找到仓库")

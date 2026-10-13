@@ -1,3 +1,10 @@
+"""RAG 检索结果语义重排（Rerank）模块.
+
+本模块负责对初召回的候选文档片段进行精细化语义重排（Re-ranking）：
+结合 Qwen Rerank API、关键词覆盖率、标题精确匹配度与时间新鲜度（Freshness Bonus）
+多因子加权打分，过滤低质量噪声，将最相关的上下文片段排在最前。
+"""
+
 import math
 import re
 from datetime import datetime, timezone
@@ -16,9 +23,11 @@ def _tokens(text: str) -> list[str]:
 
 
 def _normalise(value: float) -> float:
+    """归一化分数值至 [0.0, 1.0] 浮点区间并防御 NaN/Inf 异常值."""
     if math.isnan(value) or math.isinf(value):
         return 0.0
     return max(0.0, min(1.0, value))
+
 
 
 def _candidate_text(candidate: dict[str, Any]) -> str:

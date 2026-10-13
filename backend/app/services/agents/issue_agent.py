@@ -1,3 +1,9 @@
+"""GitHub Issue 分诊与分析智能体模块.
+
+本模块结合 LLM 深度分析能力与本地启发式规则引擎，
+对 Issue 的分类（Bug/Feature/Docs）、优先级、复杂度、指派负责人及查重进行综合诊断。
+"""
+
 import re
 from typing import Any
 
@@ -8,6 +14,14 @@ from app.services.llm.prompts import ISSUE_ANALYSIS_PROMPT
 
 
 class IssueAgent(BaseAgent):
+    """Issue 深度分诊智能体 (Issue Agent).
+
+    【Python 架构设计要点 - LLM + 启发式兜底模式 (Heuristic Fallback)】:
+    - 优先调用大语言模型 `self.llm.chat_json` 获取高维度认知分析；
+    - 当 LLM 接口超时、格式损坏或校验异常时，无缝回退至 `_fallback_analysis` 本地规则引擎，
+      保障系统在无网络或离线开发状态下的高可用性与韧性。
+    """
+
     name = "issue_analyst_agent"
     description = "分析 GitHub Issue 的分诊结论、优先级、复杂度、负责人、证据和下一步动作。"
     available_tools = ["get_issue_detail", "search_similar_issues", "search_related_code", "search_project_docs", "read_thread_context"]
@@ -16,6 +30,7 @@ class IssueAgent(BaseAgent):
         self.llm = llm or LLMClient()
 
     async def run(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """执行 Issue 诊断分诊流程."""
         fallback = self._fallback_analysis(input_data, context)
         llm_output = await self.llm.chat_json(ISSUE_ANALYSIS_PROMPT, {"issue": input_data, "context": context})
         if llm_output:

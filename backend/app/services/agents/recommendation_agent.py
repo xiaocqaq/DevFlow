@@ -1,3 +1,9 @@
+"""智能联想推荐智能体模块.
+
+本模块负责根据当前代码仓库的活跃 Issue、PR 及 CI 状态，
+动态推荐上下文相关的对话提问（Suggested Prompts），辅助开发者快速探索项目。
+"""
+
 from __future__ import annotations
 
 import re
@@ -8,11 +14,19 @@ from app.services.agents.base import BaseAgent
 
 
 class RecommendationAgent(BaseAgent):
+    """上下文联想推荐智能体 (Recommendation Agent).
+
+    【Python 语法要点 - 集合去重与数值范围截断】:
+    - 双重 `min(max(val, 4), 5)` 将数值限制在 [4, 5] 闭区间内；
+    - 集合推导式 `{normalize(item) for item in ...}` 实现 O(1) 复杂度的去重与快速查找。
+    """
+
     name = "recommendation_agent"
     description = "根据当前仓库的 Issue、PR 和 CI 状态推荐上下文相关的聊天提问。"
     available_tools = ["repository_snapshot"]
 
     async def run(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """根据仓库健康度与最新变更推荐探索问题."""
         limit = min(max(int(input_data.get("limit") or 5), 4), 5)
         excluded = {self._normalize(item) for item in input_data.get("exclude") or []}
         candidates = self._build_candidates(input_data)

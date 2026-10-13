@@ -1,3 +1,11 @@
+"""对话记忆系统与会话生命周期管理模块.
+
+本模块负责构建双层记忆体系：
+1. 会话级记忆（ConversationMemory）：当前交互上下文中的决策、开放问题与临时待办；
+2. 仓库级长期记忆（ThreadMemory）：沉淀跨会话的架构决策、团队共识与持久偏好；
+3. 会话轮次封存（Session Sealer）：会话结束时提炼摘要、生成候选记忆并清理上下文。
+"""
+
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -6,6 +14,7 @@ from typing import Any
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
+
 
 from app.core.config import settings
 from app.db.models import (

@@ -1,3 +1,9 @@
+"""工作流质量观察器模块.
+
+本模块负责在工作流各任务执行后审查输出结果，检测任务失败、证据缺失、
+低置信度、高危操作或人工复审门槛，为重规划（Replan）提供依据。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -7,11 +13,19 @@ from app.services.agents.base import BaseAgent
 
 
 class ObserverAgent(BaseAgent):
+    """工作流观察审查智能体 (Observer Agent).
+
+    【Python 语法要点 - 列表推导式与聚合计算】:
+    - 列表推导式过滤并提取特定状态的置信度值；
+    - 使用 `sum(...) / len(...)` 和边界截断 `max(0.1, min(0.95, ...))` 动态计算综合置信度。
+    """
+
     name = "observer_agent"
     description = "审查工作流任务输出中的冲突、证据缺口、低置信度和人工确认门槛。"
     available_tools = ["inspect_workflow_outputs"]
 
     async def run(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """运行输出审查逻辑，生成质量观察报告."""
         spec = WorkflowSpec.model_validate(input_data["spec"])
         results = [WorkflowTaskResult.model_validate(item) for item in input_data.get("task_results") or []]
         findings: list[WorkflowFinding] = []

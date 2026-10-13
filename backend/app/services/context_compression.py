@@ -1,3 +1,12 @@
+"""动态上下文窗口管理与智能压缩（Context Compression）模块.
+
+本模块负责监控长对话的 Token 预算消耗压力，并在上下文即将溢出前执行分级压缩策略：
+1. 轻量压缩（Microcompact）：剔除可重放的中间工具调用返回值；
+2. 语义压缩（Compact）：使用 LLM 对早期对话轮次生成要点摘要并截断；
+3. 激进压缩（Aggressive）：严格保留最近对话与关键系统证据；
+4. Prompt 缓存优化（Prompt Cache）参数注入。
+"""
+
 import json
 import re
 from dataclasses import dataclass
@@ -9,6 +18,7 @@ from app.core.config import settings
 TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_\-]+|[^\s]")
 WORD_PATTERN = re.compile(r"[a-zA-Z0-9_\-\u4e00-\u9fff]+")
 SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?\n\u3002\uff01\uff1f])\s+")
+
 
 MODEL_CONTEXT_WINDOWS = {
     "deepseek-v4-pro": 1_000_000,
@@ -76,6 +86,20 @@ PressureStage = Literal["normal", "warning", "auto_compact", "aggressive", "manu
 
 
 def estimate_tokens(text: str | None) -> int:
+    """基于字符特征与分词启发式估算字符串 Token 数量.
+
+    【Python / NLP 算法要点】:
+    1. 中文字符：每个汉字按 1 Token 计算；
+    2. 英文与数字标识符：按每 4 个字符约合 1 Token 计算，利用整除 `(len(token) + 3) // 4` 向上取整；
+    3. 特殊符号与标点：每个符号按 1 Token 计算。
+    在无需加载百兆分词器（如 tiktoken）的情况下，提供微秒级的 Token 消耗预估。
+
+    Args:
+        text: 待估算的文本字符串。
+
+    Returns:
+        int: 预估消耗的 Token 总量。
+    """
     if not text:
         return 0
     total = 0

@@ -1,4 +1,13 @@
 #!/usr/bin/env python
+"""Model Context Protocol (MCP) 独立内存服务模块.
+
+本模块实现遵循 Anthropic Model Context Protocol (MCP) 标准规范的 stdio 服务器，
+通过 JSON-RPC 2.0 协议向外部智能体客户端（如 Claude Desktop 或内建 Agent）暴露：
+- 知识检索工具：`devflow_search_evidence`
+- 线程上下文获取：`devflow_get_thread_context`
+- 会话轮次日志读取：`devflow_read_session_events`
+"""
+
 import asyncio
 import json
 import sys
@@ -23,9 +32,13 @@ from app.services.conversations import ensure_conversation  # noqa: E402
 SERVER_NAME = "devflow-memory-mcp"
 SERVER_VERSION = "0.1.0"
 
+# 【Python 语法要点 - 跨平台标准流编码重配】:
+# 在 Windows 系统下，默认的 sys.stdin/stdout/stderr 编码可能为 GBK，
+# 导致 JSON-RPC 传输多语言 Unicode 字符时崩溃。使用 `reconfigure(encoding="utf-8")` 统一强制 UTF-8。
 for stream in (sys.stdin, sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
         stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 
 def _json_schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:

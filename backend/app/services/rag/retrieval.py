@@ -1,3 +1,13 @@
+"""RAG 混合检索与结果重排管道模块.
+
+本模块实现高召回、高精度的多模态混合检索管道（Hybrid Retrieval Pipeline）：
+1. 向量语义检索（Dense Vector Retrieval，基于 Milvus）；
+2. 关键词稀疏检索（Sparse BM25 Keyword Retrieval）；
+3. 混合融合打分（Hybrid Score Fusion）与双路召回奖励；
+4. 最大边际相关（MMR）/ Jaccard 相似度去重；
+5. 重排模型精排（Cross-Encoder Rerank）。
+"""
+
 import heapq
 import hashlib
 import math
@@ -26,9 +36,23 @@ NEAR_DUPLICATE_JACCARD = 0.9
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """计算两个稠密向量之间的余弦相似度 (Cosine Similarity).
+
+    【Python 语法要点 - zip 迭代与内置生成器求和】:
+    - `sum(x * y for x, y in zip(a, b))`: 使用 `zip` 成对绑定对应维度的坐标分量计算向量点积；
+    - 分母计算两个向量的欧氏模长并防零除（`or 1.0`）。
+
+    Args:
+        a: 向量 A 浮点数列表。
+        b: 向量 B 浮点数列表。
+
+    Returns:
+        float: 取值范围在 [-1.0, 1.0] 之间的余弦相似度。
+    """
     if not a or not b:
         return 0.0
     return sum(x * y for x, y in zip(a, b)) / ((math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))) or 1.0)
+
 
 
 def _as_uuid(value: str | uuid.UUID) -> uuid.UUID:

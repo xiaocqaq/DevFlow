@@ -1,3 +1,12 @@
+"""对话交互与智能体编排 API 路由模块.
+
+本模块提供 AI 工程师主交互对话核心端点：
+- POST `/api/chat`: 支持 SSE（Server-Sent Events）流式响应与普通 JSON 模式的双通道会话；
+- POST `/api/chat/plan/execute`: 多智能体规划（Plan）任务分发与图编排执行；
+- POST `/api/chat/recommendations`: 仓库状态联想问题推荐；
+- GET `/api/chat/history`: 会话历史记录检索。
+"""
+
 import uuid
 from datetime import datetime, timedelta, timezone
 import os
@@ -34,6 +43,7 @@ from app.services.skills import SkillRegistry, get_skill_registry
 from app.services.permissions import ensure_demo_user, write_audit_log
 
 router = APIRouter()
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 BACKEND_ROOT = Path(__file__).resolve().parents[3]
@@ -1604,6 +1614,18 @@ async def _conversation_plan_execute_sse(payload: ChatPlanExecuteRequest, db: Se
 
 
 async def _conversation_response(payload: ChatRequest, db: Session) -> dict[str, Any]:
+    """处理标准非流式对话交互请求.
+
+    【系统全链路与 Python 关键逻辑】:
+    1. 校验并获取仓库 ORM 实例 `_repo_or_404`；
+    2. 确保会话存在 `ensure_conversation`；
+    3. 动态检查上下文 Token 预算裕量并触发渐进式压缩 `ProgressiveContextManager`；
+    4. 记录用户输入消息 `MessageStore.append`；
+    5. 重建并组装多源上下文证据 `ContextAssembler.assemble`；
+    6. 执行 LangGraph 主 Agent 循环 `ChatAgent().run`；
+    7. 持久化 AI 响应与 AgentRun 审计快照；
+    8. 封存会话轮次记忆 `SessionSealer.seal` 并提交事务。
+    """
     repo = _repo_or_404(db, payload.repo_id)
     conversation = ensure_conversation(db, repo.id, payload.conversation_id)
     db.commit()
@@ -1771,6 +1793,7 @@ async def _conversation_sse(payload: ChatRequest, db: Session):
 
 @router.post("/plan")
 async def chat_plan(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """生成工程多智能体执行计划图（只做任务规划分解，不立即执行）."""
     try:
         return await _conversation_plan(payload, db)
     except WorkflowTargetResolutionError as exc:
@@ -1779,21 +1802,25 @@ async def chat_plan(payload: ChatRequest, db: Session = Depends(get_db)) -> dict
 
 @router.post("/plan/execute/stream")
 async def chat_plan_execute_stream(payload: ChatPlanExecuteRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+    """以 Server-Sent Events (SSE) 流式传输执行已被人工审核确认的工作流计划图."""
     return StreamingResponse(_conversation_plan_execute_sse(payload, db), media_type="text/event-stream")
 
 
 @router.post("", response_model=ChatResponse)
 async def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """标准非流式对话主端点（等待模型全流程执行完毕后返回单次 JSON 响应）."""
     return await _conversation_response(payload, db)
 
 
 @router.post("/stream")
 async def chat_stream(payload: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+    """流式打字机对话主端点（通过 SSE 实时下发思考轨迹、工具调用与增量文本）."""
     return StreamingResponse(_conversation_sse(payload, db), media_type="text/event-stream")
 
 
 @router.post("/recommendations", response_model=PromptRecommendationResponse)
 async def prompt_recommendations(payload: PromptRecommendationRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """获取与当前仓库活跃 Issue/PR/CI 状态联想相关的推荐提问列表."""
     repo = _repo_or_404(db, payload.repo_id)
     issues, prs, runs = _repo_payload(repo.id, db)
     result = await RecommendationAgent().run(

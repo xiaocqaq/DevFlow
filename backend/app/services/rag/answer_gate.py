@@ -1,3 +1,11 @@
+"""RAG 问答质量准入门控（Answer Gate）模块.
+
+本模块负责在调用 LLM 回答用户问题前进行事实依据充分性与冲突校验：
+1. 证据覆盖率检测：确认是否含有足够支撑答案的关键实体与符号；
+2. 矛盾与极性冲突检测（Conflict Polarity）：检测证据之间是否存在相互矛盾的结论（如“允许”vs“禁止”）；
+3. 防幻觉门禁（Hallucination Prevention Gate）：若证据匮乏则主动拒答或提示用户提供更多上下文。
+"""
+
 import re
 from typing import Any
 
@@ -11,6 +19,7 @@ CONFLICT_POLARITIES = (
 
 
 def _normalise(text: str) -> str:
+    """清理字符串空白字符（将多行及多个连续空格折叠为单空格）."""
     return " ".join(str(text or "").lower().split())
 
 
@@ -30,6 +39,13 @@ def _evidence_text(item: dict[str, Any]) -> str:
 
 
 def _strong_query_signals(query: str) -> list[str]:
+    """提取查询语句中的强特征信号标识符（如函数名、文件路径、错误异常名、Issue 编号等）.
+
+    【Python 语法要点 - 保序去重技巧 (Order-preserving Deduplication)】:
+    - `list(dict.fromkeys(signals))`:
+      利用 Python 3.7+ 字典保证键插入顺序的特性，实现 O(N) 复杂度的保序去重，
+      代码比传统 `seen = set()` 循环更加精炼高效。
+    """
     candidates = re.findall(r"[A-Za-z][A-Za-z0-9_./\-]*|#\d+|\b\d{3,}\b", query)
     signals: list[str] = []
     for candidate in candidates:
@@ -40,6 +56,7 @@ def _strong_query_signals(query: str) -> list[str]:
         ):
             signals.append(candidate.lower())
     return list(dict.fromkeys(signals))
+
 
 
 def _detect_conflict(items: list[dict[str, Any]]) -> dict[str, Any] | None:

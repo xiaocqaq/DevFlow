@@ -1,3 +1,9 @@
+"""工程任务规划器模块.
+
+本模块负责根据用户目标、当前仓库实体上下文（Issue/PR/CI）和可用信号，
+将高层宏观目标分解为具备明确输入边界与依赖关系的任务有向图（WorkflowSpec）。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -7,11 +13,19 @@ from app.services.agents.base import BaseAgent
 
 
 class PlannerAgent(BaseAgent):
+    """工程任务规划智能体 (Planner Agent).
+
+    【Python 语法要点 - 意图分解与上下文提取】:
+    - 继承 `BaseAgent`，实现 `run(...)` 抽象接口；
+    - 组合 Pydantic 模型 `WorkflowTask` 与 `WorkflowClaim` 进行类型安全的规格定义。
+    """
+
     name = "planner_agent"
     description = "根据用户目标和可用仓库信号，构建有边界的工程工作流规格。"
     available_tools = ["create_workflow_spec"]
 
     async def run(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        """根据上下文信号规划任务图 DAG."""
         message = str(input_data.get("message") or input_data.get("goal") or "").strip()
         lowered = message.lower()
         tasks: list[WorkflowTask] = []

@@ -1,3 +1,9 @@
+"""Milvus 向量数据库存储与索引管理模块.
+
+本模块负责与 Milvus 向量引擎进行通信，管理 Collection（集合）的创建、
+字段模式定义、HNSW/IVF 向量索引构建，以及文档向量切片的插入、批量相似度搜索与标量过滤删除。
+"""
+
 import json
 import logging
 import uuid
@@ -16,7 +22,14 @@ logger = logging.getLogger(__name__)
 
 
 class MilvusUnavailableError(RuntimeError):
+    """Milvus 向量数据库不可用或网络连接中断自定义异常类.
+
+    【Python 语法要点】:
+    继承自内置 `RuntimeError`，由 FastAPI 全局异常处理器拦截并向客户端返回 503 降级状态。
+    """
+
     pass
+
 
 try:  # pymilvus 在测试和本地演示模式中是可选依赖。
     from pymilvus import DataType, MilvusClient
@@ -27,6 +40,15 @@ except Exception:  # pragma: no cover - 依赖缺失时会走到这里。
 
 @dataclass
 class DocumentPayload:
+    """待写入向量数据库的文档负载数据类.
+
+    【Python 语法要点 - 数据类 (Data Classes) 与可变默认字段】:
+    - 使用 `@dataclass` 装饰器自动生成 `__init__`、`__repr__` 和 `__eq__` 方法；
+    - `metadata: dict[str, Any] = field(default_factory=dict)`:
+      在数据类中声明字典等可变类型的默认值时，必须使用 `field(default_factory=dict)`，
+      否则会抛出 `ValueError: mutable default ... is not allowed`。
+    """
+
     source_type: str
     title: str
     content: str
@@ -41,7 +63,14 @@ def _as_uuid(value: uuid.UUID | str | None) -> uuid.UUID:
 
 
 def stable_source_id(repo_id: uuid.UUID | str, source_type: str, key: str) -> uuid.UUID:
+    """根据仓库、来源类型与业务唯一键生成确定性 UUIDv5.
+
+    【Python 语法要点 - 确定性 UUIDv5】:
+    - `uuid.uuid5(namespace, name)` 基于 SHA-1 散列生成；
+    - 相同输入参数在任何机器上都会生成完全相同的 UUID，用于支持向量数据的幂等写入与去重。
+    """
     return uuid.uuid5(uuid.NAMESPACE_URL, f"devflow:{repo_id}:{source_type}:{key}")
+
 
 
 def _escape_filter_value(value: str) -> str:
